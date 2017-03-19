@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Iter","Iterator over the bytes contained by the buffer."]]});

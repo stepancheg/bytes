@@ -1,0 +1,1 @@
+initSidebarItems({"trait":[["BufMut","A trait for values that provide sequential write access to bytes."]]});

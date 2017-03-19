@@ -1,0 +1,1 @@
+initSidebarItems({"trait":[["Buf","Read bytes from a buffer."]]});

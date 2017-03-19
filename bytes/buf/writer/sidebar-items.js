@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Writer","A `BufMut` adapter which implements `io::Write` for the inner value."]]});
