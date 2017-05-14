@@ -240,7 +240,7 @@ fn split_to_uninitialized() {
 
 #[test]
 fn split_off_to_at_gt_len() {
-    fn make_bytes() -> Bytes {
+    fn make_bytes() -> Bytes<'static> {
         let mut bytes = BytesMut::with_capacity(100);
         bytes.put_slice(&[10, 20, 30, 40]);
         bytes.freeze()

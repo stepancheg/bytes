@@ -97,7 +97,7 @@ impl FromBuf for Vec<u8> {
     }
 }
 
-impl FromBuf for Bytes {
+impl FromBuf for Bytes<'static> {
     fn from_buf<T>(buf: T) -> Self
         where T: IntoBuf
     {

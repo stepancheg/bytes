@@ -2,7 +2,7 @@ use {IntoBuf, Buf, BufMut};
 use buf::Iter;
 use debug;
 
-use std::{cmp, fmt, mem, hash, ops, slice, ptr, usize};
+use std::{cmp, fmt, mem, hash, ops, slice, ptr, usize, marker};
 use std::borrow::Borrow;
 use std::io::Cursor;
 use std::sync::atomic::{self, AtomicUsize, AtomicPtr};
@@ -100,8 +100,8 @@ use std::sync::atomic::Ordering::{Relaxed, Acquire, Release, AcqRel};
 ///
 /// [1] Small enough: 31 bytes on 64 bit systems, 15 on 32 bit systems.
 ///
-pub struct Bytes {
-    inner: Inner2,
+pub struct Bytes<'a> {
+    inner: Inner2<'a>,
 }
 
 /// A unique reference to a continuous slice of memory.
@@ -147,7 +147,7 @@ pub struct Bytes {
 /// assert_eq!(&b[..], b"hello");
 /// ```
 pub struct BytesMut {
-    inner: Inner2,
+    inner: Inner2<'static>,
 }
 
 // Both `Bytes` and `BytesMut` are backed by `Inner` and functions are delegated
@@ -293,20 +293,22 @@ pub struct BytesMut {
 //
 #[cfg(target_endian = "little")]
 #[repr(C)]
-struct Inner {
+struct Inner<'a> {
     arc: AtomicPtr<Shared>,
     ptr: *mut u8,
     len: usize,
     cap: usize,
+    pd: marker::PhantomData<&'a u8>,
 }
 
 #[cfg(target_endian = "big")]
 #[repr(C)]
-struct Inner {
+struct Inner<'a> {
     ptr: *mut u8,
     len: usize,
     cap: usize,
     arc: AtomicPtr<Shared>,
+    pd: marker::PhantomData<&'a u8>,
 }
 
 // This struct is only here to make older versions of Rust happy. In older
@@ -315,8 +317,8 @@ struct Inner {
 // libraries still support older versions of Rust for which it is the case. To
 // get around this, `Inner` (the actual struct) is wrapped by `Inner2` which has
 // the drop fn implementation.
-struct Inner2 {
-    inner: Inner,
+struct Inner2<'a> {
+    inner: Inner<'a>,
 }
 
 // Thread-safe reference-counted container for the shared storage. This mostly
@@ -337,7 +339,7 @@ struct Shared {
 // Buffer storage strategy flags.
 const KIND_ARC: usize = 0b00;
 const KIND_INLINE: usize = 0b01;
-const KIND_STATIC: usize = 0b10;
+const KIND_BORROWED: usize = 0b10;
 const KIND_VEC: usize = 0b11;
 const KIND_MASK: usize = 0b11;
 
@@ -369,7 +371,7 @@ const INLINE_CAP: usize = 4 * 4 - 1;
  *
  */
 
-impl Bytes {
+impl<'a> Bytes<'a> {
     /// Creates a new empty `Bytes`
     ///
     /// This will not allocate and the returned `Bytes` handle will be empty.
@@ -383,7 +385,7 @@ impl Bytes {
     /// assert_eq!(&b[..], b"");
     /// ```
     #[inline]
-    pub fn new() -> Bytes {
+    pub fn new() -> Bytes<'static> {
         Bytes {
             inner: Inner2 {
                 inner: Inner::empty(),
@@ -406,9 +408,15 @@ impl Bytes {
     /// ```
     #[inline]
     pub fn from_static(bytes: &'static [u8]) -> Bytes {
+        Bytes::from_slice(bytes)
+    }
+
+    /// Doc...
+    #[inline]
+    pub fn from_slice<'b>(bytes: &'a [u8]) -> Bytes<'a> {
         Bytes {
             inner: Inner2 {
-                inner: Inner::from_static(bytes),
+                inner: Inner::from_slice(bytes),
             }
         }
     }
@@ -463,7 +471,7 @@ impl Bytes {
     ///
     /// Requires that `begin <= end` and `end <= self.len()`, otherwise slicing
     /// will panic.
-    pub fn slice(&self, begin: usize, end: usize) -> Bytes {
+    pub fn slice(&self, begin: usize, end: usize) -> Bytes<'a> {
         let mut ret = self.clone();
 
         unsafe {
@@ -548,7 +556,7 @@ impl Bytes {
     /// # Panics
     ///
     /// Panics if `at > len`
-    pub fn split_off(&mut self, at: usize) -> Bytes {
+    pub fn split_off(&mut self, at: usize) -> Bytes<'a> {
         assert!(at <= self.len());
 
         if at == self.len() {
@@ -589,7 +597,7 @@ impl Bytes {
     /// # Panics
     ///
     /// Panics if `at > len`
-    pub fn split_to(&mut self, at: usize) -> Bytes {
+    pub fn split_to(&mut self, at: usize) -> Bytes<'a> {
         assert!(at <= self.len());
 
         if at == self.len() {
@@ -609,7 +617,7 @@ impl Bytes {
 
     #[deprecated(since = "0.4.1", note = "use split_to instead")]
     #[doc(hidden)]
-    pub fn drain_to(&mut self, at: usize) -> Bytes {
+    pub fn drain_to(&mut self, at: usize) -> Bytes<'a> {
         self.split_to(at)
     }
 
@@ -641,16 +649,18 @@ impl Bytes {
     ///
     /// assert_eq!(&a[..4], b"bary");
     /// ```
-    pub fn try_mut(mut self) -> Result<BytesMut, Bytes> {
-        if self.inner.is_mut_safe() {
-            Ok(BytesMut { inner: self.inner })
-        } else {
-            Err(self)
+    pub fn try_mut(mut self) -> Result<BytesMut, Bytes<'static>> {
+        unsafe {
+            if self.inner.is_mut_safe() {
+                Ok(BytesMut { inner: mem::transmute(self.inner) })
+            } else {
+                Err(mem::transmute(self))
+            }
         }
     }
 }
 
-impl IntoBuf for Bytes {
+impl<'a> IntoBuf for Bytes<'a> {
     type Buf = Cursor<Self>;
 
     fn into_buf(self) -> Self::Buf {
@@ -658,7 +668,7 @@ impl IntoBuf for Bytes {
     }
 }
 
-impl<'a> IntoBuf for &'a Bytes {
+impl<'a> IntoBuf for &'a Bytes<'a> {
     type Buf = Cursor<Self>;
 
     fn into_buf(self) -> Self::Buf {
@@ -666,8 +676,8 @@ impl<'a> IntoBuf for &'a Bytes {
     }
 }
 
-impl Clone for Bytes {
-    fn clone(&self) -> Bytes {
+impl<'a> Clone for Bytes<'a> {
+    fn clone(&self) -> Bytes<'a> {
         Bytes {
             inner: Inner2 {
                 inner: self.inner.shallow_clone(),
@@ -676,13 +686,13 @@ impl Clone for Bytes {
     }
 }
 
-impl AsRef<[u8]> for Bytes {
+impl<'a> AsRef<[u8]> for Bytes<'a> {
     fn as_ref(&self) -> &[u8] {
         self.inner.as_ref()
     }
 }
 
-impl ops::Deref for Bytes {
+impl<'a> ops::Deref for Bytes<'a> {
     type Target = [u8];
 
     #[inline]
@@ -691,95 +701,95 @@ impl ops::Deref for Bytes {
     }
 }
 
-impl From<BytesMut> for Bytes {
-    fn from(src: BytesMut) -> Bytes {
+impl<'a> From<BytesMut> for Bytes<'static> {
+    fn from(src: BytesMut) -> Bytes<'static> {
         src.freeze()
     }
 }
 
-impl From<Vec<u8>> for Bytes {
-    fn from(src: Vec<u8>) -> Bytes {
+impl From<Vec<u8>> for Bytes<'static> {
+    fn from(src: Vec<u8>) -> Bytes<'static> {
         BytesMut::from(src).freeze()
     }
 }
 
-impl From<String> for Bytes {
-    fn from(src: String) -> Bytes {
+impl From<String> for Bytes<'static> {
+    fn from(src: String) -> Bytes<'static> {
         BytesMut::from(src).freeze()
     }
 }
 
-impl<'a> From<&'a [u8]> for Bytes {
-    fn from(src: &'a [u8]) -> Bytes {
+impl<'a> From<&'a [u8]> for Bytes<'static> {
+    fn from(src: &'a [u8]) -> Bytes<'static> {
         BytesMut::from(src).freeze()
     }
 }
 
-impl<'a> From<&'a str> for Bytes {
-    fn from(src: &'a str) -> Bytes {
+impl<'a> From<&'a str> for Bytes<'static> {
+    fn from(src: &'a str) -> Bytes<'static> {
         BytesMut::from(src).freeze()
     }
 }
 
-impl PartialEq for Bytes {
-    fn eq(&self, other: &Bytes) -> bool {
+impl<'a> PartialEq for Bytes<'a> {
+    fn eq(&self, other: &Bytes<'a>) -> bool {
         self.inner.as_ref() == other.inner.as_ref()
     }
 }
 
-impl PartialOrd for Bytes {
-    fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
+impl<'a> PartialOrd for Bytes<'a> {
+    fn partial_cmp(&self, other: &Bytes<'a>) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(other.inner.as_ref())
     }
 }
 
-impl Ord for Bytes {
-    fn cmp(&self, other: &Bytes) -> cmp::Ordering {
+impl<'a> Ord for Bytes<'a> {
+    fn cmp(&self, other: &Bytes<'a>) -> cmp::Ordering {
         self.inner.as_ref().cmp(other.inner.as_ref())
     }
 }
 
-impl Eq for Bytes {
+impl<'a> Eq for Bytes<'a> {
 }
 
-impl Default for Bytes {
+impl Default for Bytes<'static> {
     #[inline]
-    fn default() -> Bytes {
+    fn default() -> Bytes<'static> {
         Bytes::new()
     }
 }
 
-impl fmt::Debug for Bytes {
+impl<'a> fmt::Debug for Bytes<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&debug::BsDebug(&self.inner.as_ref()), fmt)
     }
 }
 
-impl hash::Hash for Bytes {
+impl<'a> hash::Hash for Bytes<'a> {
     fn hash<H>(&self, state: &mut H) where H: hash::Hasher {
         let s: &[u8] = self.as_ref();
         s.hash(state);
     }
 }
 
-impl Borrow<[u8]> for Bytes {
+impl<'a> Borrow<[u8]> for Bytes<'a> {
     fn borrow(&self) -> &[u8] {
         self.as_ref()
     }
 }
 
-impl IntoIterator for Bytes {
+impl<'a> IntoIterator for Bytes<'a> {
     type Item = u8;
-    type IntoIter = Iter<Cursor<Bytes>>;
+    type IntoIter = Iter<Cursor<Bytes<'a>>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.into_buf().iter()
     }
 }
 
-impl<'a> IntoIterator for &'a Bytes {
+impl<'a> IntoIterator for &'a Bytes<'a> {
     type Item = u8;
-    type IntoIter = Iter<Cursor<&'a Bytes>>;
+    type IntoIter = Iter<Cursor<&'a Bytes<'a>>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.into_buf().iter()
@@ -919,7 +929,7 @@ impl BytesMut {
     /// th.join().unwrap();
     /// ```
     #[inline]
-    pub fn freeze(self) -> Bytes {
+    pub fn freeze(self) -> Bytes<'static> {
         Bytes { inner: self.inner }
     }
 
@@ -1316,8 +1326,8 @@ impl<'a> From<&'a str> for BytesMut {
     }
 }
 
-impl From<Bytes> for BytesMut {
-    fn from(src: Bytes) -> BytesMut {
+impl<'a> From<Bytes<'a>> for BytesMut {
+    fn from(src: Bytes<'a>) -> BytesMut {
         src.try_mut()
             .unwrap_or_else(|src| BytesMut::from(&src[..]))
     }
@@ -1433,34 +1443,36 @@ impl<'a> Extend<&'a u8> for BytesMut {
  *
  */
 
-impl Inner {
+impl<'a> Inner<'a> {
     #[inline]
-    fn empty() -> Inner {
+    fn empty() -> Inner<'static> {
         Inner {
             arc: AtomicPtr::new(KIND_VEC as *mut Shared),
             ptr: ptr::null_mut(),
             len: 0,
             cap: 0,
+            pd: marker::PhantomData,
         }
     }
 
     #[inline]
-    fn from_static(bytes: &'static [u8]) -> Inner {
+    fn from_slice(bytes: &'a [u8]) -> Inner<'a> {
         let ptr = bytes.as_ptr() as *mut u8;
 
         Inner {
             // `arc` won't ever store a pointer. Instead, use it to
             // track the fact that the `Bytes` handle is backed by a
             // static buffer.
-            arc: AtomicPtr::new(KIND_STATIC as *mut Shared),
+            arc: AtomicPtr::new(KIND_BORROWED as *mut Shared),
             ptr: ptr,
             len: bytes.len(),
             cap: bytes.len(),
+            pd: marker::PhantomData,
         }
     }
 
     #[inline]
-    fn from_vec(mut src: Vec<u8>) -> Inner {
+    fn from_vec(mut src: Vec<u8>) -> Inner<'static> {
         let len = src.len();
         let cap = src.capacity();
         let ptr = src.as_mut_ptr();
@@ -1475,11 +1487,12 @@ impl Inner {
             ptr: ptr,
             len: len,
             cap: cap,
+            pd: marker::PhantomData,
         }
     }
 
     #[inline]
-    fn with_capacity(capacity: usize) -> Inner {
+    fn with_capacity(capacity: usize) -> Inner<'static> {
         if capacity <= INLINE_CAP {
             unsafe {
                 // Using uninitialized memory is ~30% faster
@@ -1608,7 +1621,7 @@ impl Inner {
         }
     }
 
-    fn split_off(&mut self, at: usize) -> Inner {
+    fn split_off(&mut self, at: usize) -> Inner<'a> {
         let mut other = self.shallow_clone();
 
         unsafe {
@@ -1619,7 +1632,7 @@ impl Inner {
         return other
     }
 
-    fn split_to(&mut self, at: usize) -> Inner {
+    fn split_to(&mut self, at: usize) -> Inner<'a> {
         let mut other = self.shallow_clone();
 
         unsafe {
@@ -1711,7 +1724,7 @@ impl Inner {
             true
         } else if kind == KIND_VEC {
             true
-        } else if kind == KIND_STATIC {
+        } else if kind == KIND_BORROWED {
             false
         } else {
             // The function requires `&mut self`, which guarantees a unique
@@ -1729,7 +1742,7 @@ impl Inner {
     /// Increments the ref count. This should only be done if it is known that
     /// it can be done safely. As such, this fn is not public, instead other
     /// fns will use this one while maintaining the guarantees.
-    fn shallow_clone(&self) -> Inner {
+    fn shallow_clone(&self) -> Inner<'a> {
         // Always check `inline` first, because if the handle is using inline
         // data storage, all of the `Inner` struct fields will be gibberish.
         if self.is_inline() {
@@ -1812,7 +1825,7 @@ impl Inner {
                     // count update
                     arc = actual;
                 }
-            } else if arc as usize & KIND_MASK == KIND_STATIC {
+            } else if arc as usize & KIND_MASK == KIND_BORROWED {
                 // Static buffer
                 return Inner {
                     arc: AtomicPtr::new(arc),
@@ -1987,7 +2000,7 @@ impl Inner {
     #[inline]
     fn is_static(&mut self) -> bool {
         match self.kind() {
-            KIND_STATIC => true,
+            KIND_BORROWED => true,
             _ => false,
         }
     }
@@ -2034,7 +2047,7 @@ impl Inner {
     }
 }
 
-impl Drop for Inner2 {
+impl<'a> Drop for Inner2<'a> {
     fn drop(&mut self) {
         let kind = self.kind();
 
@@ -2098,8 +2111,8 @@ impl Shared {
     }
 }
 
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
+unsafe impl<'a> Send for Inner<'a> {}
+unsafe impl<'a> Sync for Inner<'a> {}
 
 /*
  *
@@ -2107,18 +2120,18 @@ unsafe impl Sync for Inner {}
  *
  */
 
-impl ops::Deref for Inner2 {
-    type Target = Inner;
+impl<'a> ops::Deref for Inner2<'a> {
+    type Target = Inner<'a>;
 
     #[inline]
-    fn deref(&self) -> &Inner {
+    fn deref(&self) -> &Inner<'a> {
         &self.inner
     }
 }
 
-impl ops::DerefMut for Inner2 {
+impl<'a> ops::DerefMut for Inner2<'a> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Inner {
+    fn deref_mut(&mut self) -> &mut Inner<'a> {
         &mut self.inner
     }
 }
@@ -2265,136 +2278,136 @@ impl<'a> PartialOrd<BytesMut> for &'a str {
     }
 }
 
-impl PartialEq<[u8]> for Bytes {
+impl<'a> PartialEq<[u8]> for Bytes<'a> {
     fn eq(&self, other: &[u8]) -> bool {
         self.inner.as_ref() == other
     }
 }
 
-impl PartialOrd<[u8]> for Bytes {
+impl<'a> PartialOrd<[u8]> for Bytes<'a> {
     fn partial_cmp(&self, other: &[u8]) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(other)
     }
 }
 
-impl PartialEq<Bytes> for [u8] {
-    fn eq(&self, other: &Bytes) -> bool {
+impl<'a> PartialEq<Bytes<'a>> for [u8] {
+    fn eq(&self, other: &Bytes<'a>) -> bool {
         *other == *self
     }
 }
 
-impl PartialOrd<Bytes> for [u8] {
-    fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
+impl<'a> PartialOrd<Bytes<'a>> for [u8] {
+    fn partial_cmp(&self, other: &Bytes<'a>) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl PartialEq<str> for Bytes {
+impl<'a> PartialEq<str> for Bytes<'a> {
     fn eq(&self, other: &str) -> bool {
         self.inner.as_ref() == other.as_bytes()
     }
 }
 
-impl PartialOrd<str> for Bytes {
+impl<'a> PartialOrd<str> for Bytes<'a> {
     fn partial_cmp(&self, other: &str) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(other.as_bytes())
     }
 }
 
-impl PartialEq<Bytes> for str {
-    fn eq(&self, other: &Bytes) -> bool {
+impl<'a> PartialEq<Bytes<'a>> for str {
+    fn eq(&self, other: &Bytes<'a>) -> bool {
         *other == *self
     }
 }
 
-impl PartialOrd<Bytes> for str {
-    fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
+impl<'a> PartialOrd<Bytes<'a>> for str {
+    fn partial_cmp(&self, other: &Bytes<'a>) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl PartialEq<Vec<u8>> for Bytes {
+impl<'a> PartialEq<Vec<u8>> for Bytes<'a> {
     fn eq(&self, other: &Vec<u8>) -> bool {
-        *self == &other[..]
+        self.as_ref() == &other[..]
     }
 }
 
-impl PartialOrd<Vec<u8>> for Bytes {
+impl<'a> PartialOrd<Vec<u8>> for Bytes<'a> {
     fn partial_cmp(&self, other: &Vec<u8>) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(&other[..])
     }
 }
 
-impl PartialEq<Bytes> for Vec<u8> {
+impl<'a> PartialEq<Bytes<'a>> for Vec<u8> {
     fn eq(&self, other: &Bytes) -> bool {
         *other == *self
     }
 }
 
-impl PartialOrd<Bytes> for Vec<u8> {
+impl<'a> PartialOrd<Bytes<'a>> for Vec<u8> {
     fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl PartialEq<String> for Bytes {
+impl<'a> PartialEq<String> for Bytes<'a> {
     fn eq(&self, other: &String) -> bool {
-        *self == &other[..]
+        self.as_ref() == other.as_bytes()
     }
 }
 
-impl PartialOrd<String> for Bytes {
+impl<'a> PartialOrd<String> for Bytes<'a> {
     fn partial_cmp(&self, other: &String) -> Option<cmp::Ordering> {
         self.inner.as_ref().partial_cmp(other.as_bytes())
     }
 }
 
-impl PartialEq<Bytes> for String {
+impl<'a> PartialEq<Bytes<'a>> for String {
     fn eq(&self, other: &Bytes) -> bool {
         *other == *self
     }
 }
 
-impl PartialOrd<Bytes> for String {
+impl<'a> PartialOrd<Bytes<'a>> for String {
     fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl<'a> PartialEq<Bytes> for &'a [u8] {
-    fn eq(&self, other: &Bytes) -> bool {
+impl<'a> PartialEq<Bytes<'a>> for &'a [u8] {
+    fn eq(&self, other: &Bytes<'a>) -> bool {
         *other == *self
     }
 }
 
-impl<'a> PartialOrd<Bytes> for &'a [u8] {
-    fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
+impl<'a> PartialOrd<Bytes<'a>> for &'a [u8] {
+    fn partial_cmp(&self, other: &Bytes<'a>) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl<'a> PartialEq<Bytes> for &'a str {
-    fn eq(&self, other: &Bytes) -> bool {
+impl<'a> PartialEq<Bytes<'a>> for &'a str {
+    fn eq(&self, other: &Bytes<'a>) -> bool {
         *other == *self
     }
 }
 
-impl<'a> PartialOrd<Bytes> for &'a str {
+impl<'a> PartialOrd<Bytes<'a>> for &'a str {
     fn partial_cmp(&self, other: &Bytes) -> Option<cmp::Ordering> {
         other.partial_cmp(self)
     }
 }
 
-impl<'a, T: ?Sized> PartialEq<&'a T> for Bytes
-    where Bytes: PartialEq<T>
+impl<'a, T: ?Sized> PartialEq<&'a T> for Bytes<'a>
+    where Bytes<'a>: PartialEq<T>
 {
     fn eq(&self, other: &&'a T) -> bool {
         *self == **other
     }
 }
 
-impl<'a, T: ?Sized> PartialOrd<&'a T> for Bytes
-    where Bytes: PartialOrd<T>
+impl<'a, T: ?Sized> PartialOrd<&'a T> for Bytes<'a>
+    where Bytes<'a>: PartialOrd<T>
 {
     fn partial_cmp(&self, other: &&'a T) -> Option<cmp::Ordering> {
         self.partial_cmp(&**other)
